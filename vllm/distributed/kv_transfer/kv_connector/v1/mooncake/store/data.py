@@ -6,12 +6,13 @@
 """Data classes for MooncakeStoreConnector."""
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -289,3 +290,25 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)
+
+
+@dataclass
+class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker -> scheduler per-request Mooncake load telemetry."""
+
+    # req_id -> (max load_get duration across workers, total bytes)
+    load_get_stats: dict[str, tuple[float, int]] = field(default_factory=dict)
+
+    def aggregate(
+        self, other: "KVConnectorWorkerMetadata"
+    ) -> "KVConnectorWorkerMetadata":
+        assert isinstance(other, MooncakeStoreWorkerMetadata)
+
+        merged = dict(self.load_get_stats)
+        for req_id, (duration_s, num_bytes) in other.load_get_stats.items():
+            prev_duration_s, prev_bytes = merged.get(req_id, (0.0, 0))
+            merged[req_id] = (
+                max(prev_duration_s, duration_s),
+                prev_bytes + num_bytes,
+            )
+        return MooncakeStoreWorkerMetadata(load_get_stats=merged)

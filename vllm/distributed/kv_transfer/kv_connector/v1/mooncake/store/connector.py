@@ -43,7 +43,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
-from .data import MooncakeStoreConnectorMetadata
+from .data import MooncakeStoreConnectorMetadata, MooncakeStoreWorkerMetadata
 from .metrics import MooncakeStoreConnectorStats, MooncakeStorePromMetrics
 from .scheduler import MooncakeStoreScheduler
 from .worker import MooncakeStoreWorker
@@ -218,6 +218,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return None
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
+        worker_meta = connector_output.kv_connector_worker_meta
+        if isinstance(worker_meta, MooncakeStoreWorkerMetadata):
+            assert self.connector_scheduler is not None
+            self.connector_scheduler.update_load_stats(worker_meta.load_get_stats)
+
         kv_cache_events = connector_output.kv_cache_events
         if not kv_cache_events or not isinstance(
             kv_cache_events, MooncakeStoreKVEvents
@@ -307,6 +312,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
+
+    def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.build_connector_worker_meta()
 
     @classmethod
     def build_kv_connector_stats(

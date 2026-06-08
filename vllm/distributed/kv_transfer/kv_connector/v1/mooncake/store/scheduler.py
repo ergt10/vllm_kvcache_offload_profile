@@ -341,6 +341,30 @@ class MooncakeStoreScheduler:
 
         return meta
 
+    def update_load_stats(self, load_get_stats: dict[str, tuple[float, int]]) -> None:
+        """Attach worker-side Mooncake load timings to live requests."""
+        for req_id, (duration_s, num_bytes) in load_get_stats.items():
+            request_tuple = self._unfinished_requests.get(req_id)
+            if request_tuple is None:
+                continue
+            request = request_tuple[0]
+            profile = request.kv_offload_profile
+            if profile is None:
+                profile = {}
+                request.kv_offload_profile = profile
+
+            # For MooncakeStore this is the end-to-end load_get duration, not a
+            # bare cuda memcpy time. Keep kv_copy_s populated so downstream
+            # analysis can compare it against kv_wait_s uniformly.
+            profile["kv_copy_s"] = profile.get("kv_copy_s", 0.0) + duration_s
+            profile["kv_copy_bytes"] = profile.get("kv_copy_bytes", 0) + num_bytes
+            profile["mooncake_load_get_s"] = (
+                profile.get("mooncake_load_get_s", 0.0) + duration_s
+            )
+            profile["mooncake_load_get_bytes"] = (
+                profile.get("mooncake_load_get_bytes", 0) + num_bytes
+            )
+
     def request_finished(
         self,
         request: Request,

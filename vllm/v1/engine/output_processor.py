@@ -873,6 +873,10 @@ class OutputProcessor:
             "kv_wait_s": kv_wait_s,
             "kv_copy_s": kv_copy_s,
             "kv_copy_bytes": int(profile.get("kv_copy_bytes", 0)),
+            "mooncake_load_get_s": float(profile.get("mooncake_load_get_s", 0.0)),
+            "mooncake_load_get_bytes": int(
+                profile.get("mooncake_load_get_bytes", 0)
+            ),
             "kv_wait_count": int(profile.get("kv_wait_count", 0)),
             "finish_reason": str(finish_reason),
         }

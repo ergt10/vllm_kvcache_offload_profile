@@ -47,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     ChunkedTokenDatabase,
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     PoolKey,
     ReqMeta,
 )
@@ -731,6 +732,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # _invalid_block_ids can be access by both the Worker and RecvingThread
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
+        self._load_stats_lock = threading.Lock()
+        self._load_stats: dict[str, tuple[float, int]] = {}
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -750,6 +753,27 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             invalid_block_ids = self._invalid_block_ids.copy()
             self._invalid_block_ids.clear()
         return invalid_block_ids
+
+    def _record_request_load_stats(
+        self, req_id: str, duration_s: float, num_bytes: int
+    ) -> None:
+        with self._load_stats_lock:
+            prev_duration_s, prev_bytes = self._load_stats.get(req_id, (0.0, 0))
+            self._load_stats[req_id] = (
+                prev_duration_s + duration_s,
+                prev_bytes + num_bytes,
+            )
+
+    def get_and_clear_load_stats(
+        self, req_ids: set[str]
+    ) -> dict[str, tuple[float, int]]:
+        with self._load_stats_lock:
+            stats = {
+                req_id: self._load_stats.pop(req_id)
+                for req_id in req_ids
+                if req_id in self._load_stats
+            }
+        return stats
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -840,6 +864,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        total_load_get_s = 0.0
+        total_load_get_bytes = 0
         try:
             for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
                 current_batch_keys = batch_keys
@@ -853,6 +879,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
+                load_get_duration_s = time.perf_counter() - load_get_start
+                total_load_get_s += load_get_duration_s
+                total_load_get_bytes += batch_bytes
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -886,6 +915,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     break
         except Exception as e:
             self._add_load_error_block_ids(current_batch_block_ids)
+            load_get_duration_s = time.perf_counter() - load_get_start
+            total_load_get_s += load_get_duration_s
+            total_load_get_bytes += batch_bytes
             self._record_operation(
                 "load_get",
                 load_get_start,
@@ -900,6 +932,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
+        if total_load_get_s or total_load_get_bytes:
+            self._record_request_load_stats(
+                req_id, total_load_get_s, total_load_get_bytes
+            )
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
@@ -1067,6 +1103,7 @@ class MooncakeStoreWorker:
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
+        self._connector_worker_meta = MooncakeStoreWorkerMetadata()
 
         self._kv_cache_config = kv_cache_config
         # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
@@ -1287,6 +1324,10 @@ class MooncakeStoreWorker:
             if self.load_async and self.kv_recv_thread is not None
             else set()
         )
+        if done_recving and self.kv_recv_thread is not None:
+            load_get_stats = self.kv_recv_thread.get_and_clear_load_stats(done_recving)
+            if load_get_stats:
+                self._connector_worker_meta.load_get_stats.update(load_get_stats)
 
         logger.debug(
             "Completed send: %d, recv: %d, tp_rank: %d",
@@ -1328,6 +1369,13 @@ class MooncakeStoreWorker:
             kv_connector_stats = self.kv_connector_stats
             self.kv_connector_stats = MooncakeStoreConnectorStats()
             return kv_connector_stats
+
+    def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
+        if not self._connector_worker_meta.load_get_stats:
+            return None
+        meta = self._connector_worker_meta
+        self._connector_worker_meta = MooncakeStoreWorkerMetadata()
+        return meta
 
     def _get_and_clear_finished_sending(
         self,
