@@ -43,10 +43,19 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
+    # job_id -> (max transfer time across reporting workers, total bytes)
+    completed_job_stats: dict[int, tuple[float, int]] = field(default_factory=dict)
 
-    def mark_completed(self, job_id: int) -> None:
+    def mark_completed(
+        self,
+        job_id: int,
+        transfer_time: float | None = None,
+        transfer_size: int | None = None,
+    ) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+        if transfer_time is not None and transfer_size is not None:
+            self.completed_job_stats[job_id] = (transfer_time, transfer_size)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -57,4 +66,18 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
-        return OffloadingWorkerMetadata(completed_jobs=merged)
+        merged_stats = dict(self.completed_job_stats)
+        for job_id, (
+            transfer_time,
+            transfer_size,
+        ) in other.completed_job_stats.items():
+            prev_time, prev_size = merged_stats.get(job_id, (0.0, 0))
+            merged_stats[job_id] = (
+                max(prev_time, transfer_time),
+                prev_size + transfer_size,
+            )
+
+        return OffloadingWorkerMetadata(
+            completed_jobs=merged,
+            completed_job_stats=merged_stats,
+        )

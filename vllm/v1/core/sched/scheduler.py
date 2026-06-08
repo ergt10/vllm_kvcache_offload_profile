@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.profiler import kv_offload_profile_enabled
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -82,6 +83,7 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self.profile_kv_offload = kv_offload_profile_enabled()
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -804,6 +806,12 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    profile = request.kv_offload_profile
+                    if profile is None:
+                        profile = {}
+                        request.kv_offload_profile = profile
+                    profile["_kv_wait_start_ts"] = time.monotonic()
+                    profile["kv_wait_count"] = profile.get("kv_wait_count", 0) + 1
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -824,7 +832,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
-                if self.log_stats:
+                if self.log_stats or self.profile_kv_offload:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
@@ -988,7 +996,7 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
-        if self.log_stats:
+        if self.log_stats or self.profile_kv_offload:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
@@ -1079,7 +1087,7 @@ class Scheduler(SchedulerInterface):
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
 
-        if self.log_stats:
+        if self.log_stats or self.profile_kv_offload:
             session.record_event(EngineCoreEventType.QUEUED)
 
     def _make_cached_request_data(
@@ -1561,6 +1569,7 @@ class Scheduler(SchedulerInterface):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
+                        kv_offload_profile=request.kv_offload_profile,
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
@@ -1588,6 +1597,7 @@ class Scheduler(SchedulerInterface):
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
+                        kv_offload_profile=request.kv_offload_profile,
                         trace_headers=request.trace_headers,
                     )
                 )
@@ -1819,7 +1829,7 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
-            if self.log_stats:
+            if self.log_stats or self.profile_kv_offload:
                 request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
@@ -2195,6 +2205,13 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            profile = request.kv_offload_profile
+            if profile is not None:
+                start_ts = profile.pop("_kv_wait_start_ts", None)
+                if start_ts is not None:
+                    profile["kv_wait_s"] = profile.get("kv_wait_s", 0.0) + (
+                        time.monotonic() - start_ts
+                    )
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED

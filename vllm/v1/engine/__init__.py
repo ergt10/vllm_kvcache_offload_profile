@@ -189,6 +189,7 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
 
     prefill_stats: PrefillStats | None = None
+    kv_offload_profile: dict[str, Any] | None = None
 
     routed_experts: np.ndarray | None = None
     # The number of NaNs in logits.

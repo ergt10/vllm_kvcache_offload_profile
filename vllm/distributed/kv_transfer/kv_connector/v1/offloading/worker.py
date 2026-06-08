@@ -272,7 +272,7 @@ class OffloadingConnectorWorker:
             job_id = transfer_result.job_id
             assert transfer_result.success
             if (
-                transfer_result.transfer_time
+                transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
                 and transfer_result.transfer_type is not None
             ):
@@ -282,7 +282,11 @@ class OffloadingConnectorWorker:
                     transfer_type=transfer_result.transfer_type,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
+            self._connector_worker_meta.mark_completed(
+                job_id,
+                transfer_time=transfer_result.transfer_time,
+                transfer_size=transfer_result.transfer_size,
+            )
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)

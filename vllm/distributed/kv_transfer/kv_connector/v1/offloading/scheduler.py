@@ -300,6 +300,8 @@ class OffloadingConnectorScheduler:
         # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
+        # load job_id -> (max transfer time across workers, total bytes)
+        self._load_job_copy_stats: dict[int, tuple[float, int]] = {}
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -962,6 +964,18 @@ class OffloadingConnectorScheduler:
                 )
                 continue
             job_status = self._jobs[job_id]
+            if not job_status.is_store:
+                transfer_time, transfer_size = meta.completed_job_stats.get(
+                    job_id, (0.0, 0)
+                )
+                if transfer_time or transfer_size:
+                    prev_time, prev_size = self._load_job_copy_stats.get(
+                        job_id, (0.0, 0)
+                    )
+                    self._load_job_copy_stats[job_id] = (
+                        max(prev_time, transfer_time),
+                        prev_size + transfer_size,
+                    )
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue
@@ -972,6 +986,20 @@ class OffloadingConnectorScheduler:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                transfer_time, transfer_size = self._load_job_copy_stats.pop(
+                    job_id, (0.0, 0)
+                )
+                if transfer_time or transfer_size:
+                    profile = req_status.req.kv_offload_profile
+                    if profile is None:
+                        profile = {}
+                        req_status.req.kv_offload_profile = profile
+                    profile["kv_copy_s"] = (
+                        profile.get("kv_copy_s", 0.0) + transfer_time
+                    )
+                    profile["kv_copy_bytes"] = (
+                        profile.get("kv_copy_bytes", 0) + transfer_size
+                    )
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
@@ -1069,6 +1097,7 @@ class OffloadingConnectorScheduler:
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
+        self._load_job_copy_stats.clear()
         self._block_id_to_pending_jobs.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.

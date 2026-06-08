@@ -31,7 +31,12 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.kv_offload.profiler import (
+    KVOffloadProfileWriter,
+    kv_offload_profile_enabled,
+)
 from vllm.v1.metrics.stats import (
+    FinishedRequestStats,
     IterationStats,
     LoRARequestStates,
     RequestStateStats,
@@ -172,8 +177,16 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.num_gpu_hit_tokens = 0
+        self.num_cpu_hit_tokens = 0
+        self.num_prefill_tokens = 0
+        self.kv_offload_profile: dict[str, Any] = {}
 
-        self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        self.stats = (
+            RequestStateStats(arrival_time=arrival_time)
+            if log_stats or kv_offload_profile_enabled()
+            else None
+        )
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
@@ -624,12 +637,22 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+            if engine_core_output.kv_offload_profile is not None:
+                req_state.kv_offload_profile.update(
+                    engine_core_output.kv_offload_profile
+                )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
-                    req_state.num_cached_tokens = (
-                        engine_core_output.prefill_stats.num_cached_tokens
+                    prefill_stats = engine_core_output.prefill_stats
+                    req_state.num_cached_tokens = prefill_stats.num_cached_tokens
+                    req_state.num_gpu_hit_tokens = (
+                        prefill_stats.num_local_cached_tokens
                     )
+                    req_state.num_cpu_hit_tokens = (
+                        prefill_stats.num_external_cached_tokens
+                    )
+                    req_state.num_prefill_tokens = prefill_stats.num_computed_tokens
                 req_state.is_prefilling = False
 
             if pooling_output is None:
@@ -681,8 +704,11 @@ class OutputProcessor:
                         reqs_to_abort.append(req_id)
 
                     # Track per-request stats
-                    self._update_stats_from_finished(
+                    finished_stats = self._update_stats_from_finished(
                         req_state, finish_reason, iteration_stats
+                    )
+                    self._write_kv_offload_profile(
+                        req_state, finish_reason, finished_stats
                     )
                     if self.tracing_enabled:
                         self.do_tracing(engine_core_output, req_state, iteration_stats)
@@ -797,13 +823,13 @@ class OutputProcessor:
         req_state: RequestState,
         finish_reason: FinishReason | None,
         iteration_stats: IterationStats | None,
-    ):
+    ) -> FinishedRequestStats | None:
         if iteration_stats is None:
-            return
+            return None
 
         assert finish_reason is not None
         assert req_state.stats is not None
-        iteration_stats.update_from_finished_request(
+        finished_stats = iteration_stats.update_from_finished_request(
             finish_reason=finish_reason,
             request_id=req_state.external_req_id,
             num_prompt_tokens=req_state.prompt_len,
@@ -816,3 +842,60 @@ class OutputProcessor:
         ParentRequest.observe_finished_request(
             req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
         )
+        return finished_stats
+
+    def _write_kv_offload_profile(
+        self,
+        req_state: RequestState,
+        finish_reason: FinishReason,
+        finished_stats: FinishedRequestStats | None,
+    ) -> None:
+        writer = KVOffloadProfileWriter.get()
+        if writer is None:
+            return
+
+        profile = req_state.kv_offload_profile
+        kv_wait_s = float(profile.get("kv_wait_s", 0.0))
+        kv_copy_s = float(profile.get("kv_copy_s", 0.0))
+        cached_tokens = req_state.num_gpu_hit_tokens + req_state.num_cpu_hit_tokens
+        prefill_tokens = req_state.num_prefill_tokens
+        if not (cached_tokens or prefill_tokens):
+            prefill_tokens = max(req_state.prompt_len - cached_tokens, 0)
+
+        record: dict[str, Any] = {
+            "request_id": req_state.external_req_id,
+            "internal_request_id": req_state.request_id,
+            "total_tokens": req_state.prompt_len,
+            "computed_tokens": cached_tokens,
+            "computed_gpu_tokens": req_state.num_gpu_hit_tokens,
+            "computed_cpu_tokens": req_state.num_cpu_hit_tokens,
+            "prefill_tokens": prefill_tokens,
+            "kv_wait_s": kv_wait_s,
+            "kv_copy_s": kv_copy_s,
+            "kv_copy_bytes": int(profile.get("kv_copy_bytes", 0)),
+            "kv_wait_count": int(profile.get("kv_wait_count", 0)),
+            "finish_reason": str(finish_reason),
+        }
+        if finished_stats is not None:
+            record.update(
+                {
+                    "actual_prefill_s": finished_stats.prefill_time,
+                    "decode_s": finished_stats.decode_time,
+                    "inference_s": finished_stats.inference_time,
+                    "e2e_latency_s": finished_stats.e2e_latency,
+                    "queued_s": finished_stats.queued_time,
+                    "generation_tokens": finished_stats.num_generation_tokens,
+                }
+            )
+        else:
+            record.update(
+                {
+                    "actual_prefill_s": None,
+                    "decode_s": None,
+                    "inference_s": None,
+                    "e2e_latency_s": None,
+                    "queued_s": None,
+                    "generation_tokens": None,
+                }
+            )
+        writer.write(record)

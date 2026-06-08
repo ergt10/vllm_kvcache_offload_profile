@@ -44,6 +44,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
+from vllm.v1.kv_offload.profiler import kv_offload_profile_enabled
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -661,7 +662,12 @@ class AsyncLLM(EngineClient):
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
-                        IterationStats() if (log_stats and num_outputs) else None
+                        IterationStats()
+                        if (
+                            (log_stats or kv_offload_profile_enabled())
+                            and num_outputs
+                        )
+                        else None
                     )
 
                     # Split outputs into chunks of at most

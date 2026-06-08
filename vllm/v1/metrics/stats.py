@@ -479,6 +479,8 @@ class IterationStats:
         if req_stats.is_corrupted:
             self.num_corrupted_reqs += 1
 
+        return finished_req
+
 
 class LoRAStats:
     """Tracks waiting and running request IDs for a single LoRA."""
