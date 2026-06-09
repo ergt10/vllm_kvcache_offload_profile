@@ -1029,6 +1029,8 @@ class MooncakeStoreWorker:
             protocol=store_config.protocol,
             configured_device=store_config.device_name,
         )
+        if store_config.protocol == "tcp":
+            os.environ.setdefault("MC_TCP_ENABLE_CONNECTION_POOL", "1")
         self.store = MooncakeDistributedStore()
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
