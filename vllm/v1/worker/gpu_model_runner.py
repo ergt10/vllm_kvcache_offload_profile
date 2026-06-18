@@ -153,6 +153,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_offload.profiler import kv_offload_profile_enabled
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -712,7 +713,9 @@ class GPUModelRunner(
 
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
+        self.kv_profile_encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
+        self.profile_kv_offload = kv_offload_profile_enabled()
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -2911,11 +2914,15 @@ class GPUModelRunner(
             if not mm_kwargs:
                 return []  # nothing left to encode after filtering out `prompt_embeds`
 
-        should_time = bool(
+        should_record_observability = bool(
             self.observability_config
             and self.observability_config.enable_mm_processor_stats
             and scheduler_output.scheduled_encoder_inputs
         )
+        should_record_kv_profile = bool(
+            self.profile_kv_offload and scheduler_output.scheduled_encoder_inputs
+        )
+        should_time = should_record_observability or should_record_kv_profile
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -3029,7 +3036,12 @@ class GPUModelRunner(
                 for video_idx in range(num_items):
                     video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]
                     with self.timed_encoder_operation(
-                        should_time, mm_lora_refs, current_item_idx + video_idx, 1
+                        should_time,
+                        should_record_observability,
+                        should_record_kv_profile,
+                        mm_lora_refs,
+                        current_item_idx + video_idx,
+                        1,
                     ):
                         _, _, micro_batch_mm_inputs = next(
                             group_and_batch_mm_kwargs(
@@ -3056,7 +3068,12 @@ class GPUModelRunner(
                 # size is dynamic depending on the input multimodal items.
 
                 with self.timed_encoder_operation(
-                    should_time, mm_lora_refs, current_item_idx, num_items
+                    should_time,
+                    should_record_observability,
+                    should_record_kv_profile,
+                    mm_lora_refs,
+                    current_item_idx,
+                    num_items,
                 ):
                     cudagraph_output = None
                     if (
@@ -3370,6 +3387,7 @@ class GPUModelRunner(
             req_ids=self.input_batch.req_ids.copy(),
             req_id_to_index=self.input_batch.req_id_to_index.copy(),
             kv_connector_output=kv_connector_output,
+            kv_offload_profile=self._take_kv_profile_encoder_timing_stats(),
         )
 
         if raw_pooler_output is None or not any(finished_mask):
@@ -4052,7 +4070,10 @@ class GPUModelRunner(
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
                     self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(scheduler_output)
+                    return make_empty_encoder_model_runner_output(
+                        scheduler_output,
+                        kv_offload_profile=self._take_kv_profile_encoder_timing_stats(),
+                    )
 
             if not num_scheduled_tokens:
                 if (
@@ -4580,6 +4601,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                kv_offload_profile=self._take_kv_profile_encoder_timing_stats(),
                 routed_experts=None,
             )
 
@@ -7499,10 +7521,33 @@ class GPUModelRunner(
             self.encoder_timing_registry.clear()
             return stats
 
+    def _take_kv_profile_encoder_timing_stats(
+        self,
+    ) -> dict[str, dict[str, float | int]] | None:
+        """Drain per-request MM encoder timings for KV profile records."""
+        if not self.profile_kv_offload:
+            return None
+
+        with self._encoder_timing_lock:
+            if not self.kv_profile_encoder_timing_registry:
+                return None
+
+            stats = {
+                req_id: {
+                    "mm_encode_s": stats_obj.encoder_forward_secs,
+                    "mm_encode_count": stats_obj.num_encoder_calls,
+                }
+                for req_id, stats_obj in self.kv_profile_encoder_timing_registry.items()
+            }
+            self.kv_profile_encoder_timing_registry.clear()
+            return stats
+
     @contextmanager
     def timed_encoder_operation(
         self,
         should_time: bool,
+        should_record_observability: bool,
+        should_record_kv_profile: bool,
         group_lora_refs: list[tuple[str, Any]],
         current_item_idx: int,
         num_items: int,
@@ -7512,6 +7557,8 @@ class GPUModelRunner(
 
         Args:
             should_time: Whether timing is enabled
+            should_record_observability: Whether to update observability stats
+            should_record_kv_profile: Whether to update KV profile stats
             group_lora_refs: Full list of (request_id, pos_info) tuples
             current_item_idx: Starting index for this group
             num_items: Number of items in this group
@@ -7536,12 +7583,23 @@ class GPUModelRunner(
 
             with self._encoder_timing_lock:
                 for req_id in group_request_ids:
-                    if req_id not in self.encoder_timing_registry:
-                        self.encoder_timing_registry[req_id] = EncoderTimingStats()
+                    if should_record_observability:
+                        if req_id not in self.encoder_timing_registry:
+                            self.encoder_timing_registry[req_id] = EncoderTimingStats()
 
-                    stats = self.encoder_timing_registry[req_id]
-                    stats.encoder_forward_secs += per_request_time
-                    stats.num_encoder_calls += 1
+                        stats = self.encoder_timing_registry[req_id]
+                        stats.encoder_forward_secs += per_request_time
+                        stats.num_encoder_calls += 1
+
+                    if should_record_kv_profile:
+                        if req_id not in self.kv_profile_encoder_timing_registry:
+                            self.kv_profile_encoder_timing_registry[req_id] = (
+                                EncoderTimingStats()
+                            )
+
+                        stats = self.kv_profile_encoder_timing_registry[req_id]
+                        stats.encoder_forward_secs += per_request_time
+                        stats.num_encoder_calls += 1
 
 
 @dataclass

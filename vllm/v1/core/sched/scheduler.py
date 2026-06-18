@@ -1347,6 +1347,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        kv_offload_profile = model_runner_output.kv_offload_profile
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1361,6 +1362,24 @@ class Scheduler(SchedulerInterface):
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
                 kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+
+        if kv_offload_profile:
+            for req_id, profile_update in kv_offload_profile.items():
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+
+                profile = request.kv_offload_profile
+                if profile is None:
+                    profile = {}
+                    request.kv_offload_profile = profile
+
+                profile["mm_encode_s"] = float(profile.get("mm_encode_s", 0.0)) + float(
+                    profile_update.get("mm_encode_s", 0.0)
+                )
+                profile["mm_encode_count"] = int(
+                    profile.get("mm_encode_count", 0)
+                ) + int(profile_update.get("mm_encode_count", 0))
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:

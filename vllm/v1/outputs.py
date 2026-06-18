@@ -269,6 +269,9 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # req_id -> request-level profile updates produced by the model runner.
+    kv_offload_profile: dict[str, dict[str, float | int]] | None = None
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.
@@ -317,6 +320,7 @@ class DraftTokenIds:
 
 def make_empty_encoder_model_runner_output(
     scheduler_output: "SchedulerOutput",
+    kv_offload_profile: dict[str, dict[str, float | int]] | None = None,
 ) -> ModelRunnerOutput:
     """
     Create a ModelRunnerOutput stub that contains the correct
@@ -342,6 +346,7 @@ def make_empty_encoder_model_runner_output(
         req_id_to_index=req_id_to_index,
         sampled_token_ids=sampled_token_ids,
         pooler_output=pooler_output,
+        kv_offload_profile=kv_offload_profile,
     )
 
 
