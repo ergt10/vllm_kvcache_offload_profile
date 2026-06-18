@@ -406,11 +406,27 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
+        frontend_profile = request.frontend_profile
+
         # Add the request to OutputProcessor (this process).
+        output_processor_add_start = time.perf_counter()
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        if frontend_profile is not None:
+            frontend_profile["frontend_output_processor_add_request_s"] = (
+                time.perf_counter() - output_processor_add_start
+            )
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        engine_core_add_start = time.perf_counter()
         await self.engine_core.add_request_async(request)
+        if frontend_profile is not None:
+            frontend_profile["frontend_engine_core_add_request_async_s"] = (
+                time.perf_counter() - engine_core_add_start
+            )
+            frontend_profile["frontend_pre_engine_submit_s"] = (
+                time.time() - request.arrival_time
+            )
+            frontend_profile["frontend_engine_submit_done_time_s"] = time.time()
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)

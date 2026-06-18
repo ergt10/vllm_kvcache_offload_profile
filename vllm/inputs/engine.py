@@ -22,6 +22,9 @@ class _InputOptions(TypedDict):
     arrival_time: NotRequired[float]
     """The time when the input was received (before rendering)."""
 
+    frontend_profile: NotRequired[dict[str, float]]
+    """Fine-grained frontend timing breakdown carried to request metrics."""
+
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
@@ -252,6 +255,9 @@ class EncoderDecoderInput(TypedDict):
 
     arrival_time: NotRequired[float]
     """The time when the input was received (before rendering)."""
+
+    frontend_profile: NotRequired[dict[str, float]]
+    """Fine-grained frontend timing breakdown carried to request metrics."""
 
 
 SingletonInput: TypeAlias = DecoderOnlyEngineInput | MultiModalEncDecInput

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import inspect
 import itertools
+import time
 import weakref
 from collections import defaultdict, deque
 from collections.abc import Sequence
@@ -46,7 +47,6 @@ from vllm.multimodal.processing.processor import (
 from vllm.tokenizers.hf import HfTokenizer, maybe_make_thread_pool
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
-from vllm.utils.async_utils import make_async
 from vllm.utils.func_utils import supports_kw
 
 from .base import BaseRenderer
@@ -873,10 +873,6 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             config.model_config.hf_config, "use_unified_vision_chunk", False
         )
 
-        self._apply_chat_template_async = make_async(
-            safe_apply_chat_template, executor=self._executor
-        )
-
         if self.tokenizer is not None:
             maybe_make_thread_pool(
                 self.tokenizer, config.model_config.renderer_num_workers + 1
@@ -994,6 +990,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
+        frontend_profile: dict[str, float] = {}
         model_config = self.model_config
         tokenizer = self.get_tokenizer()
 
@@ -1003,6 +1000,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 _ensure_prompt_embeds_placeholder_token(tokenizer)
             )
 
+        parse_chat_messages_start = time.perf_counter()
         conversation, mm_data, mm_uuids = await parse_chat_messages_async(
             messages,
             model_config,
@@ -1016,7 +1014,20 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
+        frontend_profile["frontend_parse_chat_messages_s"] = (
+            time.perf_counter() - parse_chat_messages_start
+        )
+        if mm_data is not None:
+            frontend_profile["frontend_mm_data_modalities"] = float(len(mm_data))
+            mm_item_count = 0
+            for items in mm_data.values():
+                try:
+                    mm_item_count += len(items)  # type: ignore[arg-type]
+                except TypeError:
+                    mm_item_count += 1
+            frontend_profile["frontend_mm_data_items"] = float(mm_item_count)
 
+        prompt_embeds_extract_start = time.perf_counter()
         prompt_embeds_tensors: list[torch.Tensor] | None = None
         if mm_data is not None and "prompt_embeds" in mm_data:
             prompt_embeds_tensors = list(
@@ -1025,6 +1036,9 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             mm_data = {k: v for k, v in mm_data.items() if k != "prompt_embeds"}
             if not mm_data:
                 mm_data = None
+        frontend_profile["frontend_prompt_embeds_extract_s"] = (
+            time.perf_counter() - prompt_embeds_extract_start
+        )
 
         chat_template_kwargs = params.get_apply_chat_template_kwargs()
         if prompt_embeds_tensors:
@@ -1033,7 +1047,10 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 logger.warning_once(_TOKENIZE_OVERRIDE_WARNING)
             chat_template_kwargs["tokenize"] = True
 
-        prompt_raw = await self._apply_chat_template_async(
+        prompt_raw = await self._run_in_executor_profiled(
+            frontend_profile,
+            "frontend_apply_chat_template",
+            safe_apply_chat_template,
             model_config,
             tokenizer,
             conversation,
@@ -1042,6 +1059,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
         # model which uses unified vision chunks for both images and videos.
+        unified_vision_chunk_start = time.perf_counter()
         if (
             self.use_unified_vision_chunk
             and mm_uuids is not None
@@ -1059,10 +1077,18 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                     video_placeholder,
                 ),
             )
+        frontend_profile["frontend_unified_vision_chunk_s"] = (
+            time.perf_counter() - unified_vision_chunk_start
+        )
 
+        parse_prompt_start = time.perf_counter()
         prompt = parse_dec_only_prompt(prompt_raw)
+        frontend_profile["frontend_parse_dec_only_prompt_s"] = (
+            time.perf_counter() - parse_prompt_start
+        )
 
         # See `render_messages` for the rationale.
+        prompt_embeds_prepare_start = time.perf_counter()
         if prompt_embeds_tensors and mm_data:
             assert prompt_embeds_placeholder_token_id is not None
             cast(dict, prompt)["_prompt_embeds"] = (
@@ -1078,11 +1104,15 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 prompt_embeds_tensors,
                 prompt_embeds_placeholder_token_id,
             )
+        frontend_profile["frontend_prompt_embeds_prepare_s"] = (
+            time.perf_counter() - prompt_embeds_prepare_start
+        )
 
         if mm_data is not None:
             prompt["multi_modal_data"] = mm_data
         if mm_uuids is not None:
             prompt["multi_modal_uuids"] = mm_uuids
+        cast(dict, prompt)["_frontend_profile"] = frontend_profile
 
         return conversation, prompt
 

@@ -8,11 +8,12 @@ This is similar in concept to the `asyncio` module.
 
 import asyncio
 import contextlib
+import time
 from asyncio import FIRST_COMPLETED, AbstractEventLoop, Future, Task
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from functools import partial
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from transformers.tokenization_utils_base import BatchEncoding
 from typing_extensions import ParamSpec
@@ -41,10 +42,7 @@ class AsyncMicrobatchTokenizer:
         self.batch_wait_timeout_s = batch_wait_timeout_s
 
         self._loop = asyncio.get_running_loop()
-        self._queues: dict[
-            tuple,
-            asyncio.Queue[tuple[str, dict, Future] | tuple[list[int], Future]],
-        ] = {}
+        self._queues: dict[tuple, asyncio.Queue[Any]] = {}
         self._batcher_tasks: list[Task] = []
 
         # Single-thread executor for blocking tokenizer calls.
@@ -62,6 +60,20 @@ class AsyncMicrobatchTokenizer:
     async def encode(self, prompt, **kwargs) -> list[int]:
         return (await self(prompt, **kwargs)).input_ids
 
+    async def encode_with_profile(
+        self, prompt, **kwargs
+    ) -> tuple[list[int], dict[str, float]]:
+        result_future: Future = self._loop.create_future()
+        timing_future: Future = self._loop.create_future()
+        key = self._queue_key("encode", kwargs)
+        queue = self._get_queue(self._loop, key)
+        await queue.put(
+            (prompt, kwargs, result_future, timing_future, time.perf_counter())
+        )
+        result = await result_future
+        timing = await timing_future
+        return result.input_ids, timing
+
     async def decode(self, token_ids, **kwargs) -> str:
         result_future: Future = self._loop.create_future()
         key = self._queue_key("decode", kwargs)
@@ -72,7 +84,7 @@ class AsyncMicrobatchTokenizer:
     # === Internal helpers ===
     def _get_queue(
         self, loop: asyncio.AbstractEventLoop, key: tuple
-    ) -> asyncio.Queue[tuple[str, dict, Future] | tuple[list[int], Future]]:
+    ) -> asyncio.Queue[Any]:
         """Get the request queue for the given operation key, creating a new
         queue and batcher task if needed."""
         queue = self._queues.get(key)
@@ -90,10 +102,13 @@ class AsyncMicrobatchTokenizer:
     async def _batch_encode_loop(self, queue: asyncio.Queue, can_batch: bool):
         """Batch incoming encode requests for efficiency."""
         while True:
-            prompt, kwargs, result_future = await queue.get()
+            item = await queue.get()
+            prompt, kwargs, result_future = item[:3]
             prompts = [prompt]
             kwargs_list = [kwargs]
             result_futures = [result_future]
+            timing_futures = [item[3] if len(item) > 3 else None]
+            enqueue_times = [item[4] if len(item) > 4 else time.perf_counter()]
             deadline = self._loop.time() + self.batch_wait_timeout_s
 
             while len(prompts) < self.max_batch_size:
@@ -101,11 +116,14 @@ class AsyncMicrobatchTokenizer:
                 if timeout <= 0:
                     break
                 try:
-                    prompt, kwargs, result_future = await asyncio.wait_for(
-                        queue.get(), timeout
-                    )
+                    item = await asyncio.wait_for(queue.get(), timeout)
+                    prompt, kwargs, result_future = item[:3]
                     prompts.append(prompt)
                     result_futures.append(result_future)
+                    timing_futures.append(item[3] if len(item) > 3 else None)
+                    enqueue_times.append(
+                        item[4] if len(item) > 4 else time.perf_counter()
+                    )
                     if not can_batch:
                         kwargs_list.append(kwargs)
                 except asyncio.TimeoutError:
@@ -114,31 +132,63 @@ class AsyncMicrobatchTokenizer:
             try:
                 # If every request uses identical kwargs we can run a single
                 # batched tokenizer call for a big speed-up.
+                submit_time = time.perf_counter()
                 if can_batch and len(prompts) > 1:
-                    batch_encode_fn = partial(self.tokenizer, prompts, **kwargs)
+                    def batch_encode_fn():
+                        worker_start = time.perf_counter()
+                        results = self.tokenizer(prompts, **kwargs)
+                        worker_done = time.perf_counter()
+                        return results, worker_start, worker_done
+
                     results = await self._loop.run_in_executor(
                         self._executor, batch_encode_fn
                     )
+                    results, worker_start, worker_done = results
 
                     for i, fut in enumerate(result_futures):
                         if not fut.done():
                             data = {k: v[i] for k, v in results.items()}
                             fut.set_result(BatchEncoding(data))
                 else:
-                    encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                        self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs)
-                    ]
+                    def encode_fn(prompts=prompts, kwargs=kwargs_list):
+                        worker_start = time.perf_counter()
+                        results = [
+                            self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs)
+                        ]
+                        worker_done = time.perf_counter()
+                        return results, worker_start, worker_done
+
                     results = await self._loop.run_in_executor(
                         self._executor, encode_fn
                     )
+                    results, worker_start, worker_done = results
 
                     for fut, res in zip(result_futures, results):
                         if not fut.done():
                             fut.set_result(res)
+
+                complete_time = time.perf_counter()
+                for timing_future, enqueue_time in zip(timing_futures, enqueue_times):
+                    if timing_future is not None and not timing_future.done():
+                        timing_future.set_result(
+                            {
+                                "frontend_tokenize_wait_s": worker_start
+                                - enqueue_time,
+                                "frontend_tokenize_executor_wait_s": worker_start
+                                - submit_time,
+                                "frontend_tokenize_run_s": worker_done
+                                - worker_start,
+                                "frontend_tokenize_complete_overhead_s": complete_time
+                                - worker_done,
+                            }
+                        )
             except Exception as e:
                 for fut in result_futures:
                     if not fut.done():
                         fut.set_exception(e)
+                for timing_future in timing_futures:
+                    if timing_future is not None and not timing_future.done():
+                        timing_future.set_exception(e)
 
     async def _batch_decode_loop(self, queue: asyncio.Queue):
         """Batch incoming decode requests for efficiency."""

@@ -154,6 +154,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        frontend_profile: dict[str, float] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -181,6 +182,7 @@ class RequestState:
         self.num_cpu_hit_tokens = 0
         self.num_prefill_tokens = 0
         self.kv_offload_profile: dict[str, Any] = {}
+        self.frontend_profile = frontend_profile
 
         self.stats = (
             RequestStateStats(arrival_time=arrival_time)
@@ -280,6 +282,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            frontend_profile=request.frontend_profile,
         )
 
     def make_request_output(
@@ -855,8 +858,6 @@ class OutputProcessor:
             return
 
         profile = req_state.kv_offload_profile
-        kv_wait_s = float(profile.get("kv_wait_s", 0.0))
-        kv_copy_s = float(profile.get("kv_copy_s", 0.0))
         cached_tokens = req_state.num_gpu_hit_tokens + req_state.num_cpu_hit_tokens
         prefill_tokens = req_state.num_prefill_tokens
         if not (cached_tokens or prefill_tokens):
@@ -864,44 +865,63 @@ class OutputProcessor:
 
         record: dict[str, Any] = {
             "request_id": req_state.external_req_id,
-            "internal_request_id": req_state.request_id,
             "total_tokens": req_state.prompt_len,
+            "prefill_tokens": prefill_tokens,
             "computed_tokens": cached_tokens,
             "computed_gpu_tokens": req_state.num_gpu_hit_tokens,
             "computed_cpu_tokens": req_state.num_cpu_hit_tokens,
-            "prefill_tokens": prefill_tokens,
-            "kv_wait_s": kv_wait_s,
-            "kv_copy_s": kv_copy_s,
-            "mm_encode_s": float(profile.get("mm_encode_s", 0.0)),
-            "mm_encode_count": int(profile.get("mm_encode_count", 0)),
+            "kv_wait_s": float(profile.get("kv_wait_s", 0.0)),
+            "kv_copy_s": float(profile.get("kv_copy_s", 0.0)),
             "kv_copy_bytes": int(profile.get("kv_copy_bytes", 0)),
             "mooncake_load_get_s": float(profile.get("mooncake_load_get_s", 0.0)),
             "mooncake_load_get_bytes": int(
                 profile.get("mooncake_load_get_bytes", 0)
             ),
-            "kv_wait_count": int(profile.get("kv_wait_count", 0)),
-            "finish_reason": str(finish_reason),
+            "mm_encode_s": float(profile.get("mm_encode_s", 0.0)),
         }
         if finished_stats is not None:
             record.update(
                 {
+                    "generation_tokens": finished_stats.num_generation_tokens,
                     "actual_prefill_s": finished_stats.prefill_time,
                     "decode_s": finished_stats.decode_time,
-                    "inference_s": finished_stats.inference_time,
                     "e2e_latency_s": finished_stats.e2e_latency,
+                    "inference_s": finished_stats.inference_time,
                     "queued_s": finished_stats.queued_time,
-                    "generation_tokens": finished_stats.num_generation_tokens,
                 }
+            )
+            record["e2e_minus_inference_s"] = (
+                finished_stats.e2e_latency - finished_stats.inference_time
             )
         else:
             record.update(
                 {
+                    "generation_tokens": None,
                     "actual_prefill_s": None,
                     "decode_s": None,
-                    "inference_s": None,
                     "e2e_latency_s": None,
+                    "inference_s": None,
                     "queued_s": None,
-                    "generation_tokens": None,
                 }
             )
+            record["e2e_minus_inference_s"] = None
+
+        frontend_profile = req_state.frontend_profile
+        if frontend_profile is not None:
+            frontend_output_keys = (
+                "frontend_pre_engine_submit_s",
+                "frontend_renderer_num_workers",
+                "frontend_mm_data_items",
+                "frontend_apply_chat_template_wait_s",
+                "frontend_apply_chat_template_run_s",
+                "frontend_tokenize_wait_s",
+                "frontend_tokenize_run_s",
+                "frontend_mm_process_wait_s",
+                "frontend_mm_process_run_s",
+            )
+            for key in frontend_output_keys:
+                value = frontend_profile.get(key)
+                if isinstance(value, (int, float)):
+                    record[key] = float(value)
+
         writer.write(record)

@@ -253,6 +253,9 @@ class InputProcessor:
         data_parallel_rank: int | None = None,
         resumable: bool = False,
     ) -> EngineCoreRequest:
+        process_inputs_start = time.perf_counter()
+        frontend_profile: dict[str, float] | None = None
+
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
 
@@ -276,6 +279,13 @@ class InputProcessor:
 
             if arrival_time is None:
                 arrival_time = prompt.get("arrival_time", time.time())  # type: ignore[assignment]
+
+            raw_frontend_profile = prompt.get("frontend_profile")
+            if isinstance(raw_frontend_profile, dict):
+                frontend_profile = {}
+                for key, value in raw_frontend_profile.items():
+                    if isinstance(key, str) and isinstance(value, (int, float)):
+                        frontend_profile[key] = float(value)
 
             processed_inputs: EngineInput = prompt  # type: ignore[assignment]
         else:
@@ -367,6 +377,12 @@ class InputProcessor:
                     )
                 )
 
+        if frontend_profile is not None:
+            frontend_profile["frontend_input_processor_s"] = (
+                time.perf_counter() - process_inputs_start
+            )
+            frontend_profile["frontend_input_processor_done_time_s"] = time.time()
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -382,6 +398,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            frontend_profile=frontend_profile,
         )
 
     def _validate_prompt_len(

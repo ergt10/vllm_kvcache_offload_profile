@@ -139,6 +139,72 @@ class BaseRenderer(ABC, Generic[_T]):
                 config.observability_config
             )
 
+    @staticmethod
+    def _merge_frontend_profile(
+        target: dict[str, float],
+        source: object,
+    ) -> None:
+        if not isinstance(source, dict):
+            return
+
+        for key, value in source.items():
+            if isinstance(key, str) and isinstance(value, (int, float)):
+                target[key] = target.get(key, 0.0) + float(value)
+
+    async def _run_in_executor_profiled(
+        self,
+        profile: dict[str, float],
+        prefix: str,
+        func: Any,
+        *args: Any,
+        executor: Executor | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        loop = asyncio.get_running_loop()
+        submit_time = time.perf_counter()
+
+        def wrapped():
+            worker_start = time.perf_counter()
+            result = func(*args, **kwargs)
+            worker_done = time.perf_counter()
+            return result, worker_start, worker_done
+
+        result, worker_start, worker_done = await loop.run_in_executor(
+            executor if executor is not None else self._executor, wrapped
+        )
+        done_time = time.perf_counter()
+        profile[f"{prefix}_s"] = done_time - submit_time
+        profile[f"{prefix}_wait_s"] = worker_start - submit_time
+        profile[f"{prefix}_run_s"] = worker_done - worker_start
+        return result
+
+    @staticmethod
+    def _engine_input_has_multimodal(engine_input: EngineInput) -> bool:
+        if engine_input["type"] == "multimodal":
+            return True
+        if engine_input["type"] != "enc_dec":
+            return False
+        return (
+            engine_input["encoder_prompt"]["type"] == "multimodal"
+            or engine_input["decoder_prompt"]["type"] == "multimodal"
+        )
+
+    @staticmethod
+    def _attach_frontend_profile(
+        engine_input: EngineInput,
+        profile: dict[str, float],
+    ) -> None:
+        request_profile = dict(profile)
+        for key in (
+            "frontend_mm_process_s",
+            "frontend_mm_process_wait_s",
+            "frontend_mm_process_run_s",
+        ):
+            value = engine_input.pop(key, None)  # type: ignore[typeddict-item]
+            if isinstance(value, (int, float)):
+                request_profile[key] = float(value)
+        engine_input["frontend_profile"] = request_profile
+
     def get_tokenizer(self) -> _T:
         tokenizer = self.tokenizer
         if tokenizer is None:
@@ -437,12 +503,24 @@ class BaseRenderer(ABC, Generic[_T]):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_async_tokenizer()
-        prompt_token_ids = await tokenizer.encode(
-            prompt["prompt"],
-            **params.get_encode_kwargs(),
-        )
+        if hasattr(tokenizer, "encode_with_profile"):
+            prompt_token_ids, tokenize_profile = await tokenizer.encode_with_profile(
+                prompt["prompt"],
+                **params.get_encode_kwargs(),
+            )
+        else:
+            prompt_token_ids = await tokenizer.encode(
+                prompt["prompt"],
+                **params.get_encode_kwargs(),
+            )
+            tokenize_profile = {}
 
-        return TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
+        tok_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
+        if tokenize_profile:
+            tok_prompt["_frontend_profile"] = (  # type: ignore[typeddict-unknown-key]
+                tokenize_profile
+            )
+        return tok_prompt
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
@@ -736,6 +814,7 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
+            mm_process_start = time.perf_counter()
             engine_input = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,
@@ -744,6 +823,15 @@ class BaseRenderer(ABC, Generic[_T]):
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
             )
+            engine_input["frontend_mm_process_s"] = (  # type: ignore[typeddict-unknown-key]
+                time.perf_counter() - mm_process_start
+            )
+            engine_input["frontend_mm_process_wait_s"] = 0.0  # type: ignore[typeddict-unknown-key]
+            engine_input[  # type: ignore[typeddict-unknown-key]
+                "frontend_mm_process_run_s"
+            ] = engine_input[
+                "frontend_mm_process_s"  # type: ignore[literal-required]
+            ]
         else:
             engine_input = tokens_input(prompt_token_ids)
 
@@ -794,14 +882,21 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
-            engine_input = await self._process_multimodal_async(
+            mm_profile: dict[str, float] = {}
+            engine_input = await self._run_in_executor_profiled(
+                mm_profile,
+                "frontend_mm_process",
+                self._process_multimodal,
                 prompt_token_ids,
                 multi_modal_data,
                 mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
                 tokenization_kwargs=None,
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
+                executor=self._mm_executor,
             )
+            for key, value in mm_profile.items():
+                engine_input[key] = value  # type: ignore[typeddict-unknown-key]
         else:
             engine_input = tokens_input(prompt_token_ids)
 
@@ -1025,10 +1120,19 @@ class BaseRenderer(ABC, Generic[_T]):
         skip_mm_cache: bool = False,
     ):
         arrival_time = time.time()
+        render_total_start = time.perf_counter()
+        frontend_profile = {
+            "frontend_arrival_time_s": arrival_time,
+            "frontend_renderer_num_workers": float(
+                self.model_config.renderer_num_workers
+            ),
+            "frontend_num_prompts": float(len(conversations)),
+        }
 
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
+        render_messages_start = time.perf_counter()
         rendered = [
             self.render_messages_async(conversation, chat_params)
             for conversation in conversations
@@ -1038,12 +1142,33 @@ class BaseRenderer(ABC, Generic[_T]):
         dict_prompts = list[DictPrompt]()
         for conv, prompt in await asyncio.gather(*rendered):
             out_conversations.append(conv)
+            if isinstance(prompt, dict):
+                self._merge_frontend_profile(
+                    frontend_profile, prompt.pop("_frontend_profile", None)
+                )
             dict_prompts.append(prompt)
+        frontend_profile["frontend_render_messages_s"] = (
+            time.perf_counter() - render_messages_start
+        )
 
+        tokenize_start = time.perf_counter()
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        frontend_profile["frontend_tokenize_prompts_s"] = (
+            time.perf_counter() - tokenize_start
+        )
+        for tok_prompt in tok_prompts:
+            if isinstance(tok_prompt, dict):
+                self._merge_frontend_profile(
+                    frontend_profile, tok_prompt.pop("_frontend_profile", None)
+                )
 
+        prompt_extras_start = time.perf_counter()
         self._apply_prompt_extras(tok_prompts, prompt_extras)
+        frontend_profile["frontend_apply_prompt_extras_s"] = (
+            time.perf_counter() - prompt_extras_start
+        )
 
+        process_for_engine_start = time.perf_counter()
         eng_prompts = await asyncio.gather(
             *(
                 self.process_for_engine_async(
@@ -1052,5 +1177,18 @@ class BaseRenderer(ABC, Generic[_T]):
                 for p in tok_prompts
             )
         )
+        frontend_profile["frontend_process_for_engine_s"] = (
+            time.perf_counter() - process_for_engine_start
+        )
+        frontend_profile["frontend_num_multimodal_engine_inputs"] = float(
+            sum(1 for prompt in eng_prompts if self._engine_input_has_multimodal(prompt))
+        )
+        frontend_profile["frontend_render_total_s"] = (
+            time.perf_counter() - render_total_start
+        )
+        frontend_profile["frontend_render_done_time_s"] = time.time()
+
+        for eng_prompt in eng_prompts:
+            self._attach_frontend_profile(eng_prompt, frontend_profile)
 
         return out_conversations, eng_prompts
